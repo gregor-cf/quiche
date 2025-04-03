@@ -1129,6 +1129,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
                 self.wait_for_data_last_called.elapsed().as_millis()
             );
         }
+        // update the last_called time before the select in case the future gets cancelled
+        // and wait_for_data is called again
+        self.wait_for_data_last_called = Instant::now();
         let t0 = Instant::now();
         select! {
             biased;
@@ -1150,6 +1153,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         if let Ok(cmd) = self.cmd_recv.try_recv() {
             H::conn_command(self, qconn, cmd)?;
         }
+
+        // and update `wait_for_data_last_called` again so we don't count time waiting in
+        // select
         self.wait_for_data_last_called = Instant::now();
 
         Ok(())
