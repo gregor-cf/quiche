@@ -39,6 +39,8 @@ use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use datagram_socket::StreamClosureKind;
 use foundations::telemetry::log;
@@ -347,6 +349,8 @@ pub struct H3Driver<H: DriverHooks> {
     /// Tracks whether we have forwarded the HTTP/3 SETTINGS frame
     /// to the [H3Controller] once.
     settings_received_and_forwarded: bool,
+
+    wait_for_data_last_called: Instant,
 }
 
 impl<H: DriverHooks> H3Driver<H> {
@@ -379,6 +383,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 waiting_streams: FuturesUnordered::new(),
 
                 settings_received_and_forwarded: false,
+                wait_for_data_last_called: Instant::now(),
             },
             H3Controller {
                 cmd_sender,
@@ -483,8 +488,9 @@ impl<H: DriverHooks> H3Driver<H> {
 
                     permit.send(InboundFrame::Body(body, false));
                 },
-                Err(h3::Error::Done) =>
-                    break StreamStatus::Done { close: false },
+                Err(h3::Error::Done) => {
+                    break StreamStatus::Done { close: false }
+                },
                 Err(_) => break StreamStatus::Done { close: true },
             }
         };
@@ -555,20 +561,26 @@ impl<H: DriverHooks> H3Driver<H> {
         match event {
             // Requests/responses are exclusively handled by hooks.
             #[cfg(not(feature = "gcongestion"))]
-            h3::Event::Headers { list, more_frames } =>
-                H::headers_received(self, qconn, InboundHeaders {
+            h3::Event::Headers { list, more_frames } => H::headers_received(
+                self,
+                qconn,
+                InboundHeaders {
                     stream_id,
                     headers: list,
                     has_body: more_frames,
-                }),
+                },
+            ),
 
             #[cfg(feature = "gcongestion")]
-            h3::Event::Headers { list, has_body } =>
-                H::headers_received(self, qconn, InboundHeaders {
+            h3::Event::Headers { list, has_body } => H::headers_received(
+                self,
+                qconn,
+                InboundHeaders {
                     stream_id,
                     headers: list,
                     has_body,
-                }),
+                },
+            ),
 
             h3::Event::Data => self.process_h3_data(qconn, stream_id),
             h3::Event::Finished => self.process_h3_fin(qconn, stream_id),
@@ -760,11 +772,17 @@ impl<H: DriverHooks> H3Driver<H> {
     ) -> H3ConnectionResult<()> {
         let mut frame = Ok(frame);
 
+        let start = Instant::now();
+        let mut cnt = 0u64;
+        let mut drops = 0u64;
         loop {
             match frame {
                 Ok(OutboundFrame::Datagram(dgram, flow_id)) => {
                     // Drop datagrams if there is no capacity
-                    let _ = datagram::send_h3_dgram(qconn, flow_id, dgram);
+                    let res = datagram::send_h3_dgram(qconn, flow_id, dgram);
+                    if res == Err(quiche::Error::Done) {
+                        drops += 1;
+                    }
                 },
                 Ok(OutboundFrame::FlowShutdown { flow_id, stream_id }) => {
                     self.finish_stream(
@@ -778,12 +796,28 @@ impl<H: DriverHooks> H3Driver<H> {
                 },
                 Ok(_) => unreachable!("Flows can't send frame of other types"),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) =>
-                    return Err(H3ConnectionError::ControllerWentAway),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(H3ConnectionError::ControllerWentAway)
+                },
+            }
+            cnt += 1;
+            if start.elapsed() > Duration::from_millis(50) {
+                log::error!(
+                    "in dgram_ready(): Spending too much time handling datagrams. cnt={}, drops={}",
+                    cnt,
+                    drops
+                );
+                break;
             }
 
             frame = self.dgram_recv.try_recv();
         }
+        log::error!(
+            "finished dgram_ready(). processed {} packets, drops={}, it took {}ms",
+            cnt,
+            drops,
+            start.elapsed().as_millis()
+        );
 
         Ok(())
     }
@@ -1012,8 +1046,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         loop {
             match self.conn_mut()?.poll(qconn) {
-                Ok((stream_id, event)) =>
-                    self.process_read_event(qconn, stream_id, event)?,
+                Ok((stream_id, event)) => {
+                    self.process_read_event(qconn, stream_id, event)?
+                },
                 Err(h3::Error::Done) => break,
                 Err(err) => {
                     // Don't bubble error up, instead keep the worker loop going
@@ -1088,6 +1123,13 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     async fn wait_for_data(
         &mut self, qconn: &mut QuicheConnection,
     ) -> QuicResult<()> {
+        if self.wait_for_data_last_called.elapsed() > Duration::from_millis(200) {
+            log::error!(
+                "It took {}ms since the previous call to wait_for_data",
+                self.wait_for_data_last_called.elapsed().as_millis()
+            );
+        }
+        let t0 = Instant::now();
         select! {
             biased;
             Some(ready) = self.waiting_streams.next() => self.upstream_ready(qconn, ready),
@@ -1095,6 +1137,12 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             Some(cmd) = self.cmd_recv.recv() => H::conn_command(self, qconn, cmd),
             r = self.hooks.wait_for_action(qconn), if H::has_wait_action(self) => r,
         }?;
+        if t0.elapsed() > Duration::from_millis(200) {
+            log::error!(
+                "The select in wait_for_data() took a long time: {}ms. dgram_recv.len()=={}",
+                t0.elapsed().as_millis(), self.dgram_recv.len()
+            );
+        }
 
         // Make sure controller is not starved, but also not prioritized in the
         // biased select. So poll it last, however also perform a try_recv
@@ -1102,6 +1150,7 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         if let Ok(cmd) = self.cmd_recv.try_recv() {
             H::conn_command(self, qconn, cmd)?;
         }
+        self.wait_for_data_last_called = Instant::now();
 
         Ok(())
     }
