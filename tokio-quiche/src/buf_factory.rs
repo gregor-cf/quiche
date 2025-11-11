@@ -39,10 +39,31 @@
 //!   data such as HTTP bodies.
 //! - The datagram pool, which retains buffers the size of a single UDP packet.
 
+use std::borrow::BorrowMut;
+
+use buffer_pool::BufWithPrefix;
 use buffer_pool::ConsumeBuffer;
 use buffer_pool::Pool;
 use buffer_pool::Pooled;
 use datagram_socket::MAX_DATAGRAM_SIZE;
+
+pub(crate) struct UninitMemWrapper<T: BorrowMut<BufWithPrefix>>(pub(crate) T);
+
+impl<T: BorrowMut<BufWithPrefix>> UninitMemWrapper<T> {
+    #[inline]
+    pub(crate) unsafe fn spare_capacity_as_u8(&mut self) -> &mut [u8] {
+        unsafe {
+            &mut *(self.0.borrow_mut().spare_capacity_mut()
+                as *mut [std::mem::MaybeUninit<u8>]
+                as *mut [u8])
+        }
+    }
+
+    pub(crate) unsafe fn assume_init(mut self, additional: usize) -> T {
+        unsafe { self.0.borrow_mut().assume_init_and_filled(additional) };
+        self.0
+    }
+}
 
 const POOL_SHARDS: usize = 8;
 const POOL_SIZE: usize = 16 * 1024;
@@ -77,15 +98,56 @@ pub type PooledDgram = Pooled<ConsumeBuffer>;
 #[cfg(feature = "zero-copy")]
 pub use self::zero_copy::QuicheBuf;
 
-/// Prefix size to reserve in a [`PooledDgram`]. Up to 8 bytes for the flow ID
-/// plus 1 byte for the flow context.
-const DGRAM_PREFIX: usize = 8 + 1;
-
 /// Handle to the crate's static buffer pools.
 #[derive(Default, Clone, Debug)]
 pub struct BufFactory;
 
+/// Prefix size to reserve in a [`PooledDgram`]. Up to 8 bytes for the flow
+/// ID plus 1 byte for the flow context.
+pub const DGRAM_HEADROOM: usize = 8 + 1;
+pub const DGRAM_BUF_SIZE: usize =
+    datagram_socket::MAX_DATAGRAM_SIZE + DGRAM_HEADROOM;
+/// The maximum amount of headroom required when using a buffer to send H3
+/// body frame. It can encoce the frame type (See
+/// [`quiche::h3::Connection::do_send_body()`]
+pub const H3_QUICHE_HEADROOM: usize = 10;
+
 impl BufFactory {
+    pub const MAX_BUF_SIZE: usize = 64 * 1024;
+
+    pub fn get_empty_buf() -> BufWithPrefix {
+        BufWithPrefix::default()
+    }
+
+    pub fn get_max_buf() -> BufWithPrefix {
+        BufWithPrefix::with_capacity(Self::MAX_BUF_SIZE)
+    }
+
+    pub fn get_h3_body_buf() -> BufWithPrefix {
+        BufWithPrefix::with_capacity_and_headroom(
+            Self::MAX_BUF_SIZE,
+            H3_QUICHE_HEADROOM,
+        )
+    }
+
+    pub fn get_dgram_buf() -> BufWithPrefix {
+        BufWithPrefix::with_capacity_and_headroom(DGRAM_BUF_SIZE, DGRAM_HEADROOM)
+    }
+
+    pub fn dgram_from_slice(slice: &[u8]) -> BufWithPrefix {
+        let mut buf = BufWithPrefix::with_capacity_and_headroom(
+            DGRAM_BUF_SIZE,
+            DGRAM_HEADROOM,
+        );
+        buf.extend(slice);
+        buf
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct BufFactoryOld;
+
+impl BufFactoryOld {
     /// The maximum size of the buffers in the generic pool. Larger buffers
     /// will shrink to this size before returning to the pool.
     pub const MAX_BUF_SIZE: usize = MAX_POOL_BUF_SIZE;
@@ -115,7 +177,7 @@ impl BufFactory {
         DATAGRAM_POOL.get_with(|d| {
             d.expand(MAX_DATAGRAM_SIZE);
             // Make room to inject a prefix
-            d.pop_front(DGRAM_PREFIX);
+            // d.pop_front(DGRAM_PREFIX);
         })
     }
 
@@ -149,19 +211,19 @@ impl BufFactory {
 
 #[cfg(feature = "zero-copy")]
 mod zero_copy {
-    use super::PooledBuf;
+    use buffer_pool::BufWithPrefix;
     use quiche::BufSplit;
 
     /// A pooled, splittable byte buffer for zero-copy [`quiche`] calls.
     #[derive(Clone, Debug)]
     pub struct QuicheBuf {
-        inner: triomphe::Arc<PooledBuf>,
+        inner: triomphe::Arc<BufWithPrefix>,
         start: usize,
         end: usize,
     }
 
     impl QuicheBuf {
-        pub(crate) fn new(inner: PooledBuf) -> Self {
+        pub(crate) fn new(inner: BufWithPrefix) -> Self {
             QuicheBuf {
                 start: 0,
                 end: inner.len(),
@@ -211,7 +273,7 @@ mod zero_copy {
         type Buf = QuicheBuf;
 
         fn buf_from_slice(buf: &[u8]) -> Self::Buf {
-            QuicheBuf::new(Self::buf_from_slice(buf))
+            QuicheBuf::new(BufWithPrefix::from_slice(buf))
         }
     }
 }

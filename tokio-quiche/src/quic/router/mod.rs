@@ -35,11 +35,12 @@ use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
 use super::QuicheConnection;
 use crate::buf_factory::BufFactory;
-use crate::buf_factory::PooledBuf;
+use crate::buf_factory::UninitMemWrapper;
 use crate::metrics::labels;
 use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
 use crate::settings::Config;
+use buffer_pool::BufWithPrefix;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
@@ -99,7 +100,7 @@ mod listener_stage_timer {
 
 #[derive(Debug)]
 struct PollRecvData {
-    bytes: usize,
+    buf: BufWithPrefix,
     // The packet's source, e.g., the peer's address
     src_addr: SocketAddr,
     // The packet's original destination. If the original destination is
@@ -155,7 +156,7 @@ where
     #[cfg(target_os = "linux")]
     reusable_cmsg_space: Vec<u8>,
 
-    current_buf: PooledBuf,
+    // current_buf: BufWithPrefix,
 
     // We keep the metrics in here, to avoid cloning them each packet
     #[cfg(target_os = "linux")]
@@ -207,8 +208,6 @@ where
                     u32 // SO_MARK
                 ),
                 config,
-
-                current_buf: BufFactory::get_max_buf(),
 
                 #[cfg(target_os = "linux")]
                 metrics_handshake_time_seconds: metrics.handshake_time_seconds(labels::QuicHandshakeStage::QueueWaiting),
@@ -387,10 +386,16 @@ where
     fn poll_recv_from(
         &mut self, cx: &mut Context<'_>,
     ) -> Poll<io::Result<PollRecvData>> {
-        let mut buf = tokio::io::ReadBuf::new(&mut self.current_buf);
-        let addr = ready!(self.socket_rx.poll_recv_from(cx, &mut buf))?;
+        let mut buf = BufFactory::get_max_buf();
+        let mut read_buf = tokio::io::ReadBuf::uninit(buf.spare_capacity_mut());
+        let addr = ready!(self.socket_rx.poll_recv_from(cx, &mut read_buf))?;
+        unsafe {
+            let n = read_buf.filled().len();
+            drop(read_buf);
+            buf.assume_init_and_filled(n);
+        }
         Poll::Ready(Ok(PollRecvData {
-            bytes: buf.filled().len(),
+            buf,
             src_addr: addr,
             rx_time: None,
             gro: None,
@@ -426,7 +431,10 @@ where
             };
 
             loop {
-                let iov_s = &mut [io::IoSliceMut::new(&mut self.current_buf)];
+                let mut buf = UninitMemWrapper(BufFactory::get_max_buf());
+                let spare_capacity = unsafe { buf.spare_capacity_as_u8() };
+
+                let iov_s = &mut [io::IoSliceMut::new(spare_capacity)];
                 match udp_socket.try_io(Interest::READABLE, || {
                     recvmsg::<SockaddrStorage>(
                         udp_socket.as_raw_fd(),
@@ -466,7 +474,7 @@ where
                         let Ok(cmsgs) = r.cmsgs() else {
                             // Best-effort if we can't read cmsgs.
                             return Poll::Ready(Ok(PollRecvData {
-                                bytes,
+                                buf: unsafe { buf.assume_init(bytes) },
                                 src_addr: peer_addr,
                                 dst_addr_override,
                                 rx_time,
@@ -578,7 +586,7 @@ where
                         }
 
                         return Poll::Ready(Ok(PollRecvData {
-                            bytes,
+                            buf: unsafe { buf.assume_init(bytes) },
                             src_addr: peer_addr,
                             dst_addr_override,
                             rx_time,
@@ -680,7 +688,7 @@ where
 
             match self.poll_recv_and_rx_time(cx) {
                 Poll::Ready(Ok(PollRecvData {
-                    bytes,
+                    buf,
                     src_addr: peer_addr,
                     dst_addr_override,
                     rx_time,
@@ -688,12 +696,6 @@ where
                     #[cfg(target_os = "linux")]
                     so_mark_data,
                 })) => {
-                    let mut buf = std::mem::replace(
-                        &mut self.current_buf,
-                        BufFactory::get_max_buf(),
-                    );
-                    buf.truncate(bytes);
-
                     let send_from = if let Some(dst_addr) = dst_addr_override {
                         log::trace!("overriding local address"; "actual_local" => dst_addr, "configured_local" => server_addr);
                         dst_addr

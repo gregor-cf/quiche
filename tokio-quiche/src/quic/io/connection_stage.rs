@@ -28,6 +28,7 @@ use std::fmt::Debug;
 use std::ops::ControlFlow;
 use std::time::Instant;
 
+use buffer_pool::BufWithPrefix;
 use tokio::sync::mpsc;
 
 use crate::quic::connection::ApplicationOverQuic;
@@ -90,7 +91,7 @@ where
 {
     // TODO: remove when AOQ::buffer() situation is sorted - that method shouldn't
     // exist
-    pub fn buffer(&mut self) -> &mut [u8] {
+    pub fn buffer(&mut self) -> &mut BufWithPrefix {
         self.application.buffer()
     }
 }

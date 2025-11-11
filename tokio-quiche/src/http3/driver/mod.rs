@@ -41,6 +41,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 
+use buffer_pool::BufWithPrefix;
 use datagram_socket::StreamClosureKind;
 use foundations::telemetry::log;
 use futures::FutureExt;
@@ -66,8 +67,7 @@ use self::streams::WaitForDownstreamData;
 use self::streams::WaitForStream;
 use self::streams::WaitForUpstreamCapacity;
 use crate::buf_factory::BufFactory;
-use crate::buf_factory::PooledBuf;
-use crate::buf_factory::PooledDgram;
+use crate::buf_factory::UninitMemWrapper;
 use crate::http3::settings::Http3Settings;
 use crate::http3::H3AuditStats;
 use crate::metrics::Metrics;
@@ -282,9 +282,9 @@ pub enum OutboundFrame {
     Body(crate::buf_factory::QuicheBuf, bool),
     /// Response body/CONNECT downstream data plus FIN flag.
     #[cfg(not(feature = "zero-copy"))]
-    Body(PooledBuf, bool),
+    Body(PooledBufX, bool),
     /// CONNECT-UDP (DATAGRAM) downstream data plus flow ID.
-    Datagram(PooledDgram, u64),
+    Datagram(BufWithPrefix, u64),
     /// An error encountered when serving the request. Stream should be closed.
     PeerStreamError,
     /// DATAGRAM flow explicitly closed.
@@ -293,7 +293,7 @@ pub enum OutboundFrame {
 
 impl OutboundFrame {
     /// Creates a body frame with the provided buffer.
-    pub fn body(body: PooledBuf, fin: bool) -> Self {
+    pub fn body(body: BufWithPrefix, fin: bool) -> Self {
         #[cfg(feature = "zero-copy")]
         let body = crate::buf_factory::QuicheBuf::new(body);
 
@@ -307,9 +307,9 @@ impl OutboundFrame {
 #[derive(Debug)]
 pub enum InboundFrame {
     /// Request body/CONNECT upstream data plus FIN flag.
-    Body(PooledBuf, bool),
+    Body(BufWithPrefix, bool),
     /// CONNECT-UDP (DATAGRAM) upstream data.
-    Datagram(PooledDgram),
+    Datagram(BufWithPrefix),
 }
 
 /// A ready-made [`ApplicationOverQuic`] which can handle HTTP/3 and MASQUE.
@@ -352,7 +352,7 @@ pub struct H3Driver<H: DriverHooks> {
     dgram_send: OutboundFrameSender,
 
     /// The buffer used to interact with the underlying IoWorker.
-    pooled_buf: PooledBuf,
+    pooled_buf: BufWithPrefix,
     /// The maximum HTTP/3 stream ID seen on this connection.
     max_stream_seen: u64,
 
@@ -385,8 +385,9 @@ impl<H: DriverHooks> H3Driver<H> {
 
                 dgram_recv,
                 dgram_send: PollSender::new(dgram_send),
-                pooled_buf: BufFactory::get_max_buf(),
                 max_stream_seen: 0,
+
+                pooled_buf: BufFactory::get_max_buf(),
 
                 waiting_streams: FuturesUnordered::new(),
 
@@ -477,13 +478,11 @@ impl<H: DriverHooks> H3Driver<H> {
                 };
             }
 
-            match conn.recv_body(qconn, stream_id, &mut self.pooled_buf) {
+            let mut buf = UninitMemWrapper(BufFactory::get_max_buf());
+            let uninit_buf = unsafe { buf.spare_capacity_as_u8() };
+            match conn.recv_body(qconn, stream_id, uninit_buf) {
                 Ok(n) => {
-                    let mut body = std::mem::replace(
-                        &mut self.pooled_buf,
-                        BufFactory::get_max_buf(),
-                    );
-                    body.truncate(n);
+                    let body = unsafe { buf.assume_init(n) };
 
                     ctx.audit_stats.add_downstream_bytes_recvd(n as u64);
                     let event = H3Event::BodyBytesReceived {
@@ -1031,7 +1030,7 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     }
 
     #[inline]
-    fn buffer(&mut self) -> &mut [u8] {
+    fn buffer(&mut self) -> &mut BufWithPrefix {
         &mut self.pooled_buf
     }
 

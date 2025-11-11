@@ -41,6 +41,7 @@ use super::connection_stage::RunningApplication;
 use super::gso::*;
 use super::utilization_estimator::BandwidthReporter;
 
+use crate::buf_factory::UninitMemWrapper;
 use crate::metrics::labels;
 use crate::metrics::Metrics;
 use crate::quic::connection::ApplicationOverQuic;
@@ -52,6 +53,7 @@ use crate::quic::QuicheConnection;
 use crate::QuicResult;
 
 use boring::ssl::SslRef;
+use buffer_pool::BufWithPrefix;
 use datagram_socket::DatagramSocketSend;
 use datagram_socket::DatagramSocketSendExt;
 use datagram_socket::MaybeConnectedSocket;
@@ -213,6 +215,11 @@ where
                         return Ok(());
                     }
 
+                    // FIXME(gregor): remove assert
+                    assert_eq!(
+                        self.write_state.bytes_written,
+                        ctx.buffer().len()
+                    );
                     self.flush_buffer_to_socket(ctx.buffer()).await;
                     packets_sent += self.write_state.num_pkts;
 
@@ -291,7 +298,7 @@ where
     }
 
     fn gather_data_from_quiche_conn(
-        &mut self, qconn: &mut QuicheConnection, send_buf: &mut [u8],
+        &mut self, qconn: &mut QuicheConnection, buf: &mut BufWithPrefix,
     ) -> QuicResult<usize> {
         let mut segment_size = None;
         let mut send_info = None;
@@ -303,6 +310,12 @@ where
 
         let now = Instant::now();
 
+        // FIXME: we should only call `sparce_capacity_as_u8()` right before
+        // each `write_packet_to_buffer()` call. But that requires more untangling
+        // of the write_state tracking. Will do later.
+        buf.clear();
+        let mut wrapped_buf = UninitMemWrapper(buf);
+        let send_buf = unsafe { wrapped_buf.spare_capacity_as_u8() };
         let send_buf = {
             let trunc = UDP_MAX_GSO_PACKET_SIZE.min(send_buf.len());
             &mut send_buf[..trunc]
@@ -337,6 +350,7 @@ where
             None
         };
 
+        // let xx = UninitMemWrapper(send_buf);
         let buffer_write_outcome = loop {
             let outcome = self.write_packet_to_buffer(
                 qconn,
@@ -413,6 +427,7 @@ where
                 }
             }
         };
+        unsafe { wrapped_buf.assume_init(self.write_state.bytes_written) };
 
         let tx_time = if gcongestion_enabled {
             initial_release_decision
@@ -676,6 +691,8 @@ where
             return Err(Box::new(quiche::Error::TlsFail));
         }
 
+        // FIXME: assert
+        assert_eq!(self.write_state.bytes_written, app.buffer().len());
         self.flush_buffer_to_socket(app.buffer()).await;
 
         Ok(())

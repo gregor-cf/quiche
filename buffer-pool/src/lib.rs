@@ -71,6 +71,37 @@ impl<T> QueueShard<T> {
     }
 }
 
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Pooled2<T: Reuse + Default>(pub T);
+
+impl<T: Reuse + Default> Pooled2<T> {
+    pub fn into_inner(mut self) -> T {
+        let inner = std::mem::take(&mut self.0);
+        inner
+    }
+}
+
+impl<T: Reuse + Default> Drop for Pooled2<T> {
+    fn drop(&mut self) {
+        todo!()
+    }
+}
+
+impl<T: Reuse + Default> Deref for Pooled2<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Reuse + Default> DerefMut for Pooled2<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// A value borrowed from the [`Pool`] that can be dereferenced to `T`.
 #[derive(Debug)]
 pub struct Pooled<T: Default + Reuse + 'static> {

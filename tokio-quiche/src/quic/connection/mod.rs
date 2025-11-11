@@ -34,6 +34,7 @@ pub use self::id::SimpleConnectionIdGenerator;
 pub(crate) use self::map::ConnectionMap;
 
 use boring::ssl::SslRef;
+use buffer_pool::BufWithPrefix;
 use datagram_socket::AsSocketStats;
 use datagram_socket::DatagramSocketSend;
 use datagram_socket::MaybeConnectedSocket;
@@ -67,7 +68,6 @@ use super::io::worker::Running;
 use super::io::worker::RunningOrClosing;
 use super::io::worker::WriteState;
 use super::QuicheConnection;
-use crate::buf_factory::PooledBuf;
 use crate::metrics::Metrics;
 use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
@@ -193,7 +193,7 @@ pub struct Incoming {
     /// Used for the `perf-quic-listener-metrics` feature.
     pub rx_time: Option<SystemTime>,
     /// The packet's contents.
-    pub buf: PooledBuf,
+    pub buf: BufWithPrefix,
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
     pub gro: Option<i32>,
@@ -694,7 +694,7 @@ pub trait ApplicationOverQuic: Send + 'static {
     ///
     /// Any data in the buffer may be overwritten by the worker. If necessary,
     /// the application should save the contents when this method is called.
-    fn buffer(&mut self) -> &mut [u8];
+    fn buffer(&mut self) -> &mut BufWithPrefix;
 
     /// Waits for an event to trigger the next iteration of the worker loop.
     ///

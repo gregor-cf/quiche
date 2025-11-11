@@ -28,31 +28,34 @@ use std::io;
 use std::task::Context;
 use std::task::Poll;
 
-use crate::ConsumeBuffer;
-use crate::Pooled;
+use crate::BufWithPrefix;
+// use crate::ConsumeBuffer;
+// use crate::Pooled;
 
-pub type PooledBuf = Pooled<ConsumeBuffer>;
+// pub type PooledBuf = Pooled<ConsumeBuffer>;
+pub type PooledBufX = BufWithPrefix;
 
 /// A trait to optimize read and write operations on pooled buffers.
 pub trait RawPoolBufIo: Send {
     fn poll_send_reserve(&mut self, cx: &mut Context) -> Poll<io::Result<()>>;
 
-    fn send_buf(&mut self, buf: PooledBuf, fin: bool) -> io::Result<()>;
+    fn send_buf(&mut self, buf: PooledBufX, fin: bool) -> io::Result<()>;
 
-    fn poll_recv_buf(&mut self, cx: &mut Context) -> Poll<io::Result<PooledBuf>>;
+    fn poll_recv_buf(&mut self, cx: &mut Context)
+        -> Poll<io::Result<PooledBufX>>;
 }
 
 pub trait RawPoolBufDatagramIo: Send {
     fn poll_send_datagrams(
-        &mut self, cx: &mut Context, datagrams: &mut [PooledBuf],
+        &mut self, cx: &mut Context, datagrams: &mut [PooledBufX],
     ) -> Poll<io::Result<usize>>;
 
     fn poll_recv_dgram(
         &mut self, cx: &mut Context,
-    ) -> Poll<io::Result<PooledBuf>>;
+    ) -> Poll<io::Result<PooledBufX>>;
 
     fn poll_recv_datagrams(
-        &mut self, cx: &mut Context, buffer: &mut Vec<PooledBuf>, limit: usize,
+        &mut self, cx: &mut Context, buffer: &mut Vec<PooledBufX>, limit: usize,
     ) -> Poll<io::Result<usize>> {
         for i in 0..limit {
             match self.poll_recv_dgram(cx) {

@@ -360,6 +360,18 @@ pub trait DatagramSocketRecvExt: DatagramSocketRecv {
         })
     }
 
+    /// Receives a single datagram message on the socket from the remote address
+    /// to which it is connected. On success, returns the number of bytes read.
+    fn recv_buf(
+        &mut self, buf: &mut ReadBuf<'_>,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        poll_fn(|cx| {
+            ready!(self.poll_recv(cx, buf)?);
+
+            Poll::Ready(Ok(buf.filled().len()))
+        })
+    }
+
     /// Receives a single datagram message on the socket. On success, returns
     /// the number of bytes read and the origin.
     fn recv_from(

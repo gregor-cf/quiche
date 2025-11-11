@@ -25,9 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use super::InboundFrame;
-use crate::buf_factory::BufFactory;
-use crate::buf_factory::PooledDgram;
 use crate::quic::QuicheConnection;
+use buffer_pool::BufWithPrefix;
 use quiche::h3::NameValue;
 use quiche::h3::{
     self,
@@ -76,16 +75,17 @@ pub(crate) fn extract_flow_id(
 
 /// Sends an HTTP/3 datagram over the QUIC connection with the given `flow_id`.
 pub(crate) fn send_h3_dgram(
-    conn: &mut QuicheConnection, flow_id: u64, mut dgram: PooledDgram,
+    conn: &mut QuicheConnection, flow_id: u64, mut dgram: BufWithPrefix,
 ) -> quiche::Result<()> {
     let mut prefix = [0u8; 8];
     let mut buf = octets::OctetsMut::with_slice(&mut prefix);
     let flow_id = buf.put_varint(flow_id)?;
 
     if dgram.add_prefix(flow_id) {
+        // FIXME
         conn.dgram_send(&dgram)
     } else {
-        let mut inner = dgram.into_inner().into_vec();
+        let mut inner = dgram.into_vec();
         inner.splice(..0, flow_id.iter().copied());
         conn.dgram_send_vec(inner)
     }
@@ -101,8 +101,10 @@ pub(crate) fn receive_h3_dgram(
     let mut buf = octets::Octets::with_slice(&dgram);
     let flow_id = buf.get_varint()?;
     let advance = buf.off();
-    let datagram =
-        InboundFrame::Datagram(BufFactory::dgram_from_slice(&dgram[advance..]));
+    // FIXME: gregor: possible panic!??
+    let datagram = InboundFrame::Datagram(BufWithPrefix::from_vec_with_headroom(
+        dgram, advance,
+    ));
 
     Ok((flow_id, datagram))
 }

@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use buffer_pool::BufWithPrefix;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use http::Request;
@@ -90,7 +91,7 @@ impl ExampleBody {
                 Ok(chunk) => {
                     for chunk in chunk.chunks(BufFactoryImpl::MAX_BUF_SIZE) {
                         let chunk = OutboundFrame::body(
-                            BufFactoryImpl::buf_from_slice(chunk),
+                            BufWithPrefix::from_slice(chunk),
                             false,
                         );
                         frame_sender.send(chunk).await.ok()?;
@@ -108,7 +109,7 @@ impl ExampleBody {
         }
 
         frame_sender
-            .send(OutboundFrame::Body(BufFactoryImpl::get_empty_buf(), true))
+            .send(OutboundFrame::body(BufFactoryImpl::get_empty_buf(), true))
             .await
             .ok()?;
 
